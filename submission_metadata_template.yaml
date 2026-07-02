@@ -21,8 +21,8 @@ team_members:
   - name: "Siddhant Patil"
     email: "siddhantpatil2829@gmail.com"
     role: "Data Engineer"
-  - name:"Bhavesh Negi"
-    email:"bhavesh.negi@iitg.ac.in"
+  - name: "Bhavesh Negi"
+    email: "bhavesh.negi@iitg.ac.in"
     
   # Add more members as needed; solo participants list just one member
 
@@ -38,7 +38,7 @@ sandbox_link: "https://www.kaggle.com/code/montagem/the-final"
 # candidate sample. See Section 10.5 of submission_spec.md for acceptable
 # platforms (HuggingFace Spaces, Streamlit Cloud, Replit, Colab, Docker, Binder).
 
-reproduce_command: "python rank.py --candidates ./candidates.jsonl --out ./submission.csv"
+reproduce_command: "python precompute.py --candidates candidates.jsonl --outdir artifacts/ && python rank.py --candidates candidates.jsonl --artifacts artifacts/ --out submission.csv"
 # The single command that produces submission.csv from candidates.jsonl.
 # Should run end-to-end within 5 minutes on CPU with 16GB RAM and no network.
 
