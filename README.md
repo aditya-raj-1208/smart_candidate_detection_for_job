@@ -1,47 +1,33 @@
-# ai-hackathon
-# Intelligent Candidate Discovery Engine
+#Redrob AI Candidate Ranking System
+##Overview
+This repository contains the solution for the Redrob AI ranking hackathon. The system discovers, filters, and ranks the top 100 AI engineering candidates out of a 100,000-candidate dataset.
+To strictly comply with the Stage 3 sandbox constraints (offline execution, 5-minute wall-clock limit, CPU-only), the architecture is bifurcated into two phases:
+1. Offline Pre-computation (precompute.py): Handles the heavy NLP, parsing, artifact generation, and model caching. No time limit applies here.
+2. Online Ranking (rank.py): Executes high-speed matrix math, gating logic, and localized cross-encoder reranking entirely offline in under 5 minutes.
+##Setup Instructions
+1.Clone the repository:
+git clone <your-repo-url>
+cd <your-repo-directory>
 
-This repository provides an automated, purely data-driven pipeline for ranking job candidates based on their career history, skills, and engagement metrics.
 
-## Requirements
-
-Install the dependencies before running the scripts:
-
-```bash
+2.Install Dependencies:
 pip install -r requirements.txt
-```
 
-## Workflow
 
-The pipeline is split into two deterministic steps: **Precomputation** (generating artifacts from the dataset) and **Ranking** (scoring the pool against a specific job description).
+3.Data Placement:
+Ensure your candidate dataset (candidates.jsonl or candidates.jsonl.gz) and the Job Description text file (job_description.txt) are placed in the repository root.
 
-### 1. Precomputation
+##Reproduction Steps
+###Phase 1: Pre-computation (Offline Artifact Generation)
+This script parses the 100K candidates, computes all behavioral/trajectory gating multipliers, builds the BM25 index, and caches the Hugging Face cross-encoder model locally so Phase 2 can execute without network access.
+Command:
+python precompute.py --candidates ./candidates.jsonl --outdir ./artifacts
 
-Generate the BM25 index, gating metadata, and cross-encoder model. This step requires the raw candidates file (`.jsonl` or `.jsonl.gz`).
 
-```bash
-python precompute.py \
-    --candidates candidates.jsonl.gz \
-    --outdir artifacts/
-```
+(Note: This step generates bm25_index.pkl, candidate_metadata.pkl, and a local cross_encoder_model/ directory inside the ./artifacts folder. These artifacts are strictly required for Phase 2).
+###Phase 2: Online Ranking (Stage 3 Reproduction)
+This is the single command that produces the final submission CSV from the candidates file and the pre-computed artifacts. It executes hybrid retrieval, mathematical gating, and deep semantic reranking.
+Command:
+python rank.py --candidates ./candidates.jsonl --jd ./job_description.txt --artifacts ./artifacts --out ./submission.csv
 
-### 2. Ranking
-
-Score the candidates based on a specific Job Description (JD). This step uses the precomputed artifacts for lightning-fast retrieval and deep semantic reranking.
-
-**Important**: The `--candidates` file is required for dataset compatibility validation (SHA-256 hash checking) to ensure the artifacts match the raw data.
-
-```bash
-python rank.py \
-    --candidates candidates.jsonl.gz \
-    --jd job_description.txt \
-    --artifacts artifacts/ \
-    --out submission.csv
-```
-
-## Reproducibility
-
-- The pipeline uses strict fixed random seeds (NumPy, Python) to guarantee deterministic outputs.
-- File operations dynamically support both `.jsonl` and `.jsonl.gz` datasets seamlessly.
-- Artifacts are verified against the input candidates file via SHA-256 hash checks to prevent out-of-sync evaluations.
 
