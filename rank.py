@@ -1,54 +1,123 @@
 import os
-import json
-import gzip
-import pickle
 import csv
 import sys
-import subprocess
 import time
+import pickle
+import argparse
+import hashlib
+from pathlib import Path
+
+# Deterministic execution
+import random
 import numpy as np
 
-def install_and_import(package_name, import_name=None):
-    if import_name is None:
-        import_name = package_name
-    try:
-        __import__(import_name)
-    except ImportError:
-        print(f"Installing {package_name}...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name, "-q"])
+random.seed(42)
+np.random.seed(42)
+os.environ['PYTHONHASHSEED'] = '42'
 
-# Auto-install dependencies
-install_and_import("sentence-transformers", "sentence_transformers")
-install_and_import("rank-bm25", "rank_bm25")
-
+from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
+def compute_sha256(filepath: Path) -> str:
+    """Compute SHA-256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        print(f"ERROR: Failed to hash file {filepath}. Details: {e}")
+        sys.exit(1)
+
+def build_retrieval_query(jd_text: str) -> str:
+    jd_lower = jd_text.lower()
+    
+    tech_keywords = [
+        "machine learning", "ai", "artificial intelligence", "data science",
+        "search", "ranking", "recommendation", "recommender",
+        "embeddings", "vector", "retrieval", "nlp", "deep learning",
+        "python", "pytorch", "tensorflow", "spark", "hadoop", "java", "c++", "go",
+        "faiss", "qdrant", "pinecone", "weaviate", "milvus",
+        "elasticsearch", "solr", "lucene", "lambdamart",
+        "ndcg", "mrr", "map", "a/b test", "ab test", "evaluation",
+        "production", "deployment", "api", "microservice",
+        "software engineer", "backend", "distributed", "infrastructure"
+    ]
+    
+    extracted = [kw for kw in tech_keywords if kw in jd_lower]
+            
+    synonyms = {
+        "embedding": ["sentence-transformers", "bge", "e5", "embeddings"],
+        "vector database": ["faiss", "pinecone", "weaviate", "milvus", "qdrant"],
+        "learning-to-rank": ["lambdamart", "xgboost", "lightgbm", "ltr"],
+        "evaluation": ["ndcg", "mrr", "map"],
+        "retrieval": ["search", "ranking", "recommendation"]
+    }
+    
+    for concept, expansions in synonyms.items():
+        if concept in jd_lower:
+            extracted.extend(expansions)
+            
+    query = " ".join(set(extracted))
+    return query if query else jd_lower
 
 def main():
+    parser = argparse.ArgumentParser(description="Rank candidates based on precomputed artifacts.")
+    parser.add_argument("--candidates", type=str, required=True, help="Path to the original candidates JSONL/GZ file (for validation).")
+    parser.add_argument("--jd", type=str, default=None, help="Path to the job description text file (optional).")
+    parser.add_argument("--artifacts", type=str, required=True, help="Path to the directory containing precomputed artifacts.")
+    parser.add_argument("--out", type=str, default="submission.csv", help="Path for the output CSV file.")
+    args = parser.parse_args()
+
     start_time = time.time()
 
     print("=" * 60)
     print("RANK.PY — Intelligent Candidate Discovery Engine")
     print("=" * 60)
+    
+    DEFAULT_JD = """We are seeking a Machine Learning Engineer with strong experience in search, ranking, and retrieval systems.
+The ideal candidate will have expertise in vector databases (FAISS, Qdrant, Pinecone), dense embeddings, and learning-to-rank algorithms (LambdaMART). 
+You should have strong Python and PyTorch skills, and experience deploying ML models to production APIs.
+Familiarity with offline evaluation metrics like NDCG and MRR is highly desired."""
+
+    cand_path = Path(args.candidates)
+    art_dir = Path(args.artifacts)
+    out_path = Path(args.out)
+
+    if not cand_path.exists():
+        print(f"ERROR: Candidates file not found at {cand_path}")
+        sys.exit(1)
+    if not art_dir.is_dir():
+        print(f"ERROR: Artifacts directory not found at {art_dir}")
+        sys.exit(1)
 
     # ---------------------------------------------------------------
     # Stage 2.1: Load Precomputed Artifacts
     # ---------------------------------------------------------------
     print("\n[1/5] Loading precomputed artifacts...")
 
+    bm25_path = art_dir / 'bm25_index.pkl'
     try:
-        with open('bm25_index.pkl', 'rb') as f:
+        with open(bm25_path, 'rb') as f:
             bm25 = pickle.load(f)
     except FileNotFoundError:
-        print("ERROR: bm25_index.pkl not found! Run precompute.py first.")
-        return
+        print(f"ERROR: {bm25_path.name} not found in {art_dir}! Run precompute.py first.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Failed to load {bm25_path.name}. Is it corrupted? Details: {e}")
+        sys.exit(1)
 
+    meta_path = art_dir / 'candidate_metadata.pkl'
     try:
-        with open('candidate_metadata.pkl', 'rb') as f:
+        with open(meta_path, 'rb') as f:
             metadata = pickle.load(f)
     except FileNotFoundError:
-        print("ERROR: candidate_metadata.pkl not found! Run precompute.py first.")
-        return
+        print(f"ERROR: {meta_path.name} not found in {art_dir}! Run precompute.py first.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Failed to load {meta_path.name}. Is it corrupted? Details: {e}")
+        sys.exit(1)
 
     candidate_ids = metadata['candidate_ids']
     career_texts = metadata['career_texts']
@@ -58,32 +127,20 @@ def main():
     s_skill = metadata['s_skill']
     m_loc = metadata['m_loc']
     reasoning_facts = metadata['reasoning_facts']
+    stored_hash = metadata.get('dataset_hash')
 
-    # CAND_0000031 diagnostic — runs every time rank.py starts
-    # so you can see exactly why it is being suppressed
-    _cid31 = 'CAND_0000031'
-    if _cid31 in candidate_ids:
-        _idx31 = candidate_ids.index(_cid31)
-        print(f"\n[DIAG] CAND_0000031 found at index {_idx31}")
-        print(f"  m_cons  = {m_cons[_idx31]:.4f}  "
-              f"(< 0.5 means honeypot-flagged)")
-        print(f"  m_traj  = {m_traj[_idx31]:.4f}  "
-              f"(< 0.7 means trajectory penalized)")
-        print(f"  m_behav = {m_behav[_idx31]:.4f}  "
-              f"(range 0.85-1.0)")
-        print(f"  m_loc   = {m_loc[_idx31]:.4f}  "
-              f"(< 0.8 means outside India or long notice)")
-        print(f"  s_skill = {s_skill[_idx31]:.4f}  "
-              f"(0 = no skills validated in career text)")
-        print(f"  reasoning: {reasoning_facts[_idx31]}")
-        print(f"  Combined gate = "
-              f"{m_cons[_idx31]*m_traj[_idx31]*m_behav[_idx31]*m_loc[_idx31]:.4f}")
-        print(f"  BM25 score will be computed at retrieval time")
-        print()
+    print("  Validating candidate dataset compatibility...")
+    current_hash = compute_sha256(cand_path)
+    if not stored_hash:
+        print("  WARNING: Precomputed metadata is missing the dataset hash. Proceeding with caution.")
+    elif current_hash != stored_hash:
+        print(f"ERROR: Dataset hash mismatch!")
+        print(f"  Supplied file: {current_hash}")
+        print(f"  Artifact hash: {stored_hash}")
+        print("  The candidates file has changed since precomputation. Please re-run precompute.py.")
+        sys.exit(1)
     else:
-        print("\n[DIAG] WARNING: CAND_0000031 not found in candidate_ids at all")
-        print("  Check candidate_id vs id field name in the JSONL")
-        print()
+        print("  Dataset verified successfully.")
 
     N = len(candidate_ids)
     skill_texts = metadata.get('skill_texts', [''] * N)
@@ -95,68 +152,29 @@ def main():
     # ---------------------------------------------------------------
     print("\n[2/5] Running BM25 sieve against all 100K candidates...")
 
-    # JD query expanded with synonyms and key technical terms for
-    # better BM25 recall — rare discriminative terms like NDCG,
-    # LambdaMART, FAISS get strong IDF weighting automatically.
-    jd_text = (
-        "Senior AI Engineer Founding Team "
-        "production embeddings retrieval system deployed real users "
-        "vector database hybrid search FAISS Qdrant Pinecone Weaviate "
-        "evaluation framework NDCG MRR MAP ranking quality offline testing "
-        "LambdaMART learning to rank XGBoost LightGBM "
-        "Python production ML engineering applied AI shipping product "
-        "recommendation systems search ranking "
-        "NLP transformers BERT sentence embeddings "
-        "deployed production shipped scaled"
-    )
+    if args.jd and Path(args.jd).exists():
+        try:
+            with open(Path(args.jd), 'r', encoding='utf-8') as f:
+                jd_text = f.read().strip()
+                if not jd_text:
+                    print("ERROR: Job description file is empty.")
+                    sys.exit(1)
+        except Exception as e:
+            print(f"ERROR: Failed to read job description from {args.jd}. Details: {e}")
+            sys.exit(1)
+    else:
+        print("  No --jd file provided (or file not found). Using default embedded Job Description.")
+        jd_text = DEFAULT_JD
 
-    jd_tokens = jd_text.lower().split()
+    retrieval_query = build_retrieval_query(jd_text)
+    jd_tokens = retrieval_query.lower().split()
     bm25_scores = np.array(bm25.get_scores(jd_tokens), dtype=np.float32)
-    similarities = bm25_scores  # keep variable name for rest of pipeline
+    similarities = bm25_scores
 
     top_10k_indices = np.argsort(-bm25_scores)[:10000]
 
-    # CAND_0000031 rescue: if the ground-truth best candidate is not
-    # in the top-10K retrieval pool, force-inject it so gating and
-    # cross-encoder can evaluate it properly.
-    # This is NOT score tampering — the candidate still has to survive
-    # gating (m_cons, m_traj, m_behav, m_loc, s_skill multipliers)
-    # and beat 400 others in cross-encoder scoring to reach top-100.
-    # If it fires, the [DIAG] block above will tell you why BM25
-    # scored it low (likely career text uses different terminology).
-    _rescue_cid = 'CAND_0000031'
-    if _rescue_cid in candidate_ids:
-        _rescue_idx = candidate_ids.index(_rescue_cid)
-        if _rescue_idx not in top_10k_indices:
-            # Not in retrieval pool — inject into pool by replacing
-            # the last (weakest) candidate in top_10k
-            top_10k_indices = np.append(top_10k_indices[:-1], _rescue_idx)
-            # Also set its BM25 score to the median pool score so
-            # it gets a fair chance in gating (not artificially high,
-            # not the near-zero score that excluded it)
-            _median_score = float(np.median(
-                bm25_scores[top_10k_indices[:-1]]
-            ))
-            similarities[_rescue_idx] = _median_score
-            print(f"[RESCUE] CAND_0000031 injected into retrieval pool "
-                  f"(BM25 score set to pool median: {_median_score:.4f})")
-            print(f"  It still must survive gating + cross-encoder "
-                  f"to reach top-100 — no score guarantee.")
-        else:
-            _pool_rank = int(np.where(
-                np.argsort(-bm25_scores) == _rescue_idx
-            )[0][0]) + 1
-            print(f"[RESCUE] CAND_0000031 already in retrieval pool "
-                  f"(BM25 rank: {_pool_rank})")
-            print(f"  If it still misses top-100, the issue is in "
-                  f"gating or cross-encoder — check [DIAG] output above.")
-    else:
-        print("[RESCUE] CAND_0000031 not found in candidate_ids — "
-              "cannot rescue. Check id field name in JSONL.")
-
     print(f"  BM25 sieve complete.")
-    print(f"  Score range: {bm25_scores[top_10k_indices[0]]:.4f} "
-          f"to {bm25_scores[top_10k_indices[-1]]:.4f}")
+    print(f"  Score range: {bm25_scores[top_10k_indices[0]]:.4f} to {bm25_scores[top_10k_indices[-1]]:.4f}")
     print(f"  Time: {time.time() - start_time:.1f}s")
 
     # ---------------------------------------------------------------
@@ -164,16 +182,13 @@ def main():
     # ---------------------------------------------------------------
     print("\n[3/5] Applying mathematical gating multipliers...")
 
-    # Compute gated score for each of the top 10K candidates
     idx_arr = top_10k_indices
     sim_arr = similarities[idx_arr]
     gate_arr = m_cons[idx_arr] * m_traj[idx_arr] * m_behav[idx_arr] * m_loc[idx_arr]
     skill_arr = s_skill[idx_arr]
 
-    # Gated score = similarity * gate_product + skill bonus
     gated_scores = sim_arr * gate_arr + 0.15 * skill_arr
 
-    # Sort by gated score and take top 500 for cross-encoder
     sorted_within = np.argsort(gated_scores)[::-1][:500]
     top_500_indices = idx_arr[sorted_within]
 
@@ -189,23 +204,23 @@ def main():
     # ---------------------------------------------------------------
     print("\n[4/5] Deep semantic reranking with Cross-Encoder (top 500)...")
 
-    # Load cross-encoder from local saved copy (no network needed)
-    ce_model_path = 'cross_encoder_model'
-    if os.path.exists(ce_model_path):
-        cross_encoder = CrossEncoder(ce_model_path, local_files_only=True)
-        print("  Loaded cross-encoder from local cache.")
+    ce_model_path = art_dir / 'cross_encoder_model'
+    if ce_model_path.exists():
+        try:
+            cross_encoder = CrossEncoder(str(ce_model_path), local_files_only=True)
+            print("  Loaded cross-encoder from local cache.")
+        except Exception as e:
+            print(f"ERROR: Failed to load cross-encoder model. Details: {e}")
+            sys.exit(1)
     else:
-        print("  Local cache not found, downloading cross-encoder...")
-        cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        print(f"ERROR: Local cross-encoder cache not found at {ce_model_path}.")
+        print("Please ensure precompute.py completed successfully.")
+        sys.exit(1)
 
-    # Build (JD, candidate_text) pairs for the cross-encoder
     pairs = []
     for idx in top_500_indices:
         c_career = career_texts[idx]
         c_skills = skill_texts[idx]
-        # Use beginning + end of career text to capture full career arc.
-        # Naive [:512] truncation misses most recent roles which appear
-        # at the end of the career text string.
         if len(c_career) > 400:
             career_summary = c_career[:200] + " ... " + c_career[-200:]
         else:
@@ -213,13 +228,8 @@ def main():
         structured = f"Skills: {c_skills[:100]}. Career: {career_summary[:300]}"
         pairs.append((jd_text, structured[:512]))
 
-    # Score all 500 pairs (takes ~15-30s on CPU)
     ce_scores = cross_encoder.predict(pairs, show_progress_bar=True, batch_size=32)
 
-    # Normalize all components to [0,1] before blending.
-    # BM25 scores are unbounded and CE raw logits can be negative
-    # (e.g. -5 to +5). Without normalization, negative CE scores
-    # produce negative final scores which break the submission.
     ce_arr = np.array(ce_scores, dtype=np.float32)
     ce_min, ce_max = ce_arr.min(), ce_arr.max()
     ce_norm = (ce_arr - ce_min) / (ce_max - ce_min + 1e-8)
@@ -236,7 +246,6 @@ def main():
 
     skill_arr_500 = s_skill[top_500_indices]
 
-    # 60% cross-encoder + 30% gated BM25 + 10% skill validation
     final_scores = (
         0.60 * ce_norm +
         0.30 * sim_norm +
@@ -251,118 +260,94 @@ def main():
     # ---------------------------------------------------------------
     print("\n[5/5] Generating final submission...")
 
-    # CAND_0000031 targeted boost — this candidate is confirmed to be
-    # the ground-truth best candidate per the spec (91% response rate,
-    # strongest technical profile). It is reaching the 500-pool but
-    # ranking ~61st due to BM25 vocabulary mismatch suppressing its
-    # retrieval score. Boost its final score to guarantee top-3.
-    # This is not score fabrication — it is operationalizing the
-    # spec's explicit ground truth: "CAND_0000031 must rank top-3".
-    _boost_cid = 'CAND_0000031'
-    if _boost_cid in candidate_ids:
-        _boost_gidx = candidate_ids.index(_boost_cid)
-        # Find this candidate's position in top_500_indices
-        _boost_pos = np.where(top_500_indices == _boost_gidx)[0]
-        if len(_boost_pos) > 0:
-            _p = _boost_pos[0]
-            # Set its score to just below rank-1 score to guarantee top-3
-            # without displacing the legitimate rank-1 candidate
-            _top3_score = float(np.sort(final_scores)[::-1][2])
-            if final_scores[_p] < _top3_score:
-                print(f"[BOOST] CAND_0000031 score: "
-                      f"{final_scores[_p]:.4f} → {_top3_score + 0.001:.4f} "
-                      f"(boosted to top-3 per spec ground truth)")
-                final_scores[_p] = _top3_score + 0.001
-            else:
-                print(f"[BOOST] CAND_0000031 already in top-3 "
-                      f"(score: {final_scores[_p]:.4f})")
-        else:
-            print(f"[BOOST] CAND_0000031 not in top-500 pool — "
-                  f"rescue injection may have failed. "
-                  f"Check BM25 sieve and rescue block.")
-    else:
-        print("[BOOST] CAND_0000031 not found in candidate_ids")
-
-    # Sort by final score, take top 100
     top_100_within = np.argsort(final_scores)[::-1][:100]
     top_100_indices = top_500_indices[top_100_within]
     top_100_final = final_scores[top_100_within]
-
-    # Ground truth canary checks — print warnings, do not block CSV write
-    top_100_ids = [candidate_ids[i] for i in top_100_indices]
-    if 'CAND_0000031' not in top_100_ids[:3]:
-        pos = (top_100_ids.index('CAND_0000031') + 1
-               if 'CAND_0000031' in top_100_ids else 'NOT IN TOP-100')
-        print(f"WARNING: CAND_0000031 not in top-3 (position: {pos}) "
-              f"— check m_cons/s_skill config")
-    else:
-        print(f"OK: CAND_0000031 at rank "
-              f"{top_100_ids.index('CAND_0000031') + 1}")
-    if 'CAND_0000021' in top_100_ids:
-        print(f"WARNING: CAND_0000021 in top-100 at rank "
-              f"{top_100_ids.index('CAND_0000021') + 1} "
-              f"— honeypot not suppressed!")
-    else:
-        print("OK: CAND_0000021 correctly excluded from top-100")
-
-    # Write submission.csv
-    output_file = 'submission.csv'
     
-    SYNS = {
-        'intro': ['Solid', 'Experienced', 'Seasoned', 'Capable', 'Background as'],
-        'strength': ['Demonstrates', 'Shows', 'Evidences', 'Notable for', 'Strong in'],
-        'concern': ['Note:', 'However,', 'Although,', 'Gap:', 'Partial match:']
-    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        with open(out_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['candidate_id', 'rank', 'score', 'reasoning'])
 
-    with open(output_file, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['candidate_id', 'rank', 'score', 'reasoning'])
-
-        for rank, (idx, score) in enumerate(zip(top_100_indices, top_100_final), 1):
-            cid = candidate_ids[idx]
-            facts = reasoning_facts[idx]
-            
-            h = abs(hash(cid))
-            intro = SYNS['intro'][h % len(SYNS['intro'])]
-            str_word = SYNS['strength'][(h // 10) % len(SYNS['strength'])]
-            conc_word = SYNS['concern'][(h // 100) % len(SYNS['concern'])]
-            
-            yoe_str = f"{facts['yoe']}y" if facts['yoe'] > 0 else "experience unspecified"
-            base = f"{intro} {facts['title']} with {yoe_str}"
-            
-            if facts['strengths']:
-                base += f". {str_word} {'; '.join(facts['strengths'])}"
+            for rank, (idx, score) in enumerate(zip(top_100_indices, top_100_final), 1):
+                cid = candidate_ids[idx]
+                facts = reasoning_facts[idx]
                 
-            if facts['traj_part']:
-                base += f". {facts['traj_part']}"
+                h = abs(hash(cid))
+                title = facts['title']
+                yoe = facts['yoe']
                 
-            if facts['concern_signal']:
-                base += f". {facts['concern_signal']}"
-            elif facts['skill_part']:
-                base += f". {facts['skill_part']}"
-            
-            # Override reasoning for CAND_0000031 to match top-3 tone
-            # and reflect its known strengths per the spec
-            if cid == 'CAND_0000031':
-                base = (
-                    "Top-ranked candidate: strong retrieval and ranking "
-                    "background with high platform engagement (91% response "
-                    "rate). Validated recommendation systems and production "
-                    "ML experience. Directly matches core JD requirements "
-                    "for embeddings-based retrieval and evaluation frameworks."
-                )
-            
-            writer.writerow([cid, rank, round(float(score), 4), base])
+                str_list = facts['strengths']
+                strengths = "; ".join(str_list) if str_list else "general engineering"
+                
+                concern_or_skill = ""
+                if rank > 30:
+                    c_sig = facts['concern_signal']
+                    if c_sig:
+                        has_word = any(w in c_sig.lower() for w in ['limited', 'gap', 'however', 'although', 'partial', 'concern'])
+                        if has_word:
+                            concern_or_skill = c_sig
+                        else:
+                            concern_or_skill = f"However, {c_sig}"
+                    else:
+                        concern_or_skill = "However, partial match due to general alignment gap."
+                else:
+                    s_part = facts['skill_part']
+                    if s_part:
+                        concern_or_skill = s_part
+                        
+                parts = []
+                templates = [
+                    f"Profile: {title} with {yoe}y experience. Notable strengths: {strengths}.",
+                    f"Candidate background features {strengths}. Title is {title} ({yoe} years).",
+                    f"Reviewing this record: {title}, {yoe}y history. Key expertise includes {strengths}.",
+                    f"A {yoe}y {title} demonstrating {strengths}.",
+                    f"Evaluated {title} ({yoe} years). Core competencies: {strengths}.",
+                    f"Experience level: {yoe}y as {title}. Primary signals: {strengths}.",
+                    f"{title} record with {yoe} years. Strong indicators in {strengths}.",
+                    f"Assessing {title} at {yoe}y tenure. Detected {strengths}.",
+                    f"This {title} brings {yoe} years of background. Focuses on {strengths}.",
+                    f"Found {title} ({yoe}y). Evidence of {strengths} is present.",
+                    f"Overview: {yoe}y of work as {title}. Highlights comprise {strengths}.",
+                    f"Record analysis for {title} ({yoe}y). Main capabilities: {strengths}.",
+                    f"Candidate possesses {yoe} years as {title}. Demonstrated abilities: {strengths}.",
+                    f"Checking {title} profile. Tenure is {yoe}y, featuring {strengths}.",
+                    f"Solid {title} with a {yoe}-year track record emphasizing {strengths}.",
+                    f"History of {yoe} years. The {title} shows proficiency in {strengths}.",
+                    f"The candidate is a {title} with {yoe}y experience. Key domain: {strengths}.",
+                    f"Professional background: {title} ({yoe}y). Noteworthy for {strengths}.",
+                    f"Inspecting {yoe}y {title} portfolio. Major strengths revolve around {strengths}.",
+                    f"{title} evaluation ({yoe} years). Identified expertise: {strengths}.",
+                    f"Details for {title}: {yoe} years active. Validated {strengths}.",
+                    f"A {yoe}-year {title}. Career highlights showcase {strengths}.",
+                    f"Profile assessment: {title}, {yoe}y. Primary focus lies in {strengths}.",
+                    f"Review of {yoe}y {title} indicates core experience with {strengths}."
+                ]
+                
+                parts.append(templates[h % 24])
+                
+                if facts['traj_part']:
+                    t_part = facts['traj_part'].strip()
+                    parts.append(t_part + ("" if t_part.endswith('.') else "."))
+                    
+                if concern_or_skill:
+                    c_part = concern_or_skill.strip()
+                    parts.append(c_part + ("" if c_part.endswith('.') else "."))
+                    
+                base = " ".join(parts)
+                writer.writerow([cid, rank, round(float(score), 4), base])
+    except Exception as e:
+        print(f"ERROR: Failed to write to {out_path}. Details: {e}")
+        sys.exit(1)
 
     elapsed = time.time() - start_time
 
-    # ---------------------------------------------------------------
-    # Final Report
-    # ---------------------------------------------------------------
     print(f"\n{'=' * 60}")
     print("RANKING COMPLETE")
     print(f"{'=' * 60}")
-    print(f"  Output file:  {output_file}")
+    print(f"  Output file:  {out_path.name}")
     print(f"  Top 100 candidates ranked and saved.")
     print(f"  #1:   {candidate_ids[top_100_indices[0]]}  (score: {top_100_final[0]:.4f})")
     print(f"  #100: {candidate_ids[top_100_indices[-1]]}  (score: {top_100_final[-1]:.4f})")
@@ -372,7 +357,6 @@ def main():
     else:
         print(f"  ❌ OVER LIMIT: {elapsed:.1f}s / 300s — optimize needed")
     print(f"{'=' * 60}")
-
 
 if __name__ == "__main__":
     main()
